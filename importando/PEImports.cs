@@ -40,8 +40,6 @@ record ModuleImport(string DllName, uint DllNameRva, uint OriginalFirstThunkRva,
     }
 }
 
-record ImportUpdate(string ImportName, string DllName, IFunctionImport Import);
-
 record NewImportDataSize(int ThunksArraySize, int StringsArraySize, int ImportDescTableSize)
 {
     public int TotalSize => 2 * ThunksArraySize /* orig first and first */ +
@@ -126,7 +124,7 @@ internal static class PEImports
                 importDescriptor.FirstThunk, firstThunks));
         }
 
-        return imports.ToArray();
+        return [.. imports];
     }
 
     // This is a port to C# of a FindAndAllocateNearBase function from the Detours library
@@ -196,62 +194,6 @@ internal static class PEImports
             }
         }
         return nuint.Zero;
-    }
-
-    public static ((string ForwardFrom, string ForwardTo)[], ImportUpdate[]) ParseImportUpdates(string[] importUpdates)
-    {
-        static ImportUpdate ParseFunctionImport(string s)
-        {
-            var byOrdinalParts = s.Split('#');
-            if (byOrdinalParts.Length == 2 && uint.TryParse(byOrdinalParts[1], out var ordinal))
-            {
-                var dllName = byOrdinalParts[0].ToUpperInvariant();
-                return new($"{dllName}#{ordinal}", dllName, new FunctionImportByOrdinal(ordinal));
-            }
-            else
-            {
-                var byNameParts = s.Split('!');
-                if (byNameParts.Length == 2)
-                {
-                    var dllName = byNameParts[0].ToUpperInvariant();
-                    var functionName = byNameParts[1];
-                    return new($"{dllName}!{functionName}", dllName, new FunctionImportByName(0, 0, functionName));
-                }
-                else
-                {
-                    throw new ArgumentException($"Invalid import update: {s}");
-                }
-            }
-        }
-
-        var updates = new Dictionary<string, ImportUpdate>();
-        var forwardings = new HashSet<(string, string)>();
-
-        for (int i = 0; i < importUpdates.Length; i++)
-        {
-            var importUpdate = importUpdates[i];
-            var forwarding = importUpdate.Split(':');
-            if (forwarding.Length == 1)
-            {
-                var update = ParseFunctionImport(forwarding[0]);
-                updates.TryAdd(update.ImportName, update);
-            }
-            else if (forwarding.Length == 2)
-            {
-                var original = ParseFunctionImport(forwarding[0]);
-                var forwarded = ParseFunctionImport(forwarding[1]);
-
-                updates.TryAdd(original.ImportName, original);
-                updates.TryAdd(forwarded.ImportName, forwarded);
-
-                forwardings.Add((original.ImportName, forwarded.ImportName));
-            }
-            else
-            {
-                throw new ArgumentException($"Invalid import update: {importUpdate}");
-            }
-        }
-        return ([.. forwardings], [.. updates.Values]);
     }
 
     public static ModuleImport[] PrepareNewModuleImports(ModuleImport[] existingImports, ImportUpdate[] updates,
@@ -329,7 +271,7 @@ internal static class PEImports
                     {
                         OriginalFirstThunkRva = 0,
                         FirstThunkRva = 0,
-                        FirstThunks = newThunks.ToArray()
+                        FirstThunks = [.. newThunks]
                     });
                 }
 
@@ -344,7 +286,7 @@ internal static class PEImports
             imports.Add(new ModuleImport(newDllName, 0, 0, 0, thunks));
         }
 
-        return imports.ToArray();
+        return [.. imports];
     }
 
     public static NewImportDataSize CalculateImportDirectorySize(ModuleImport[] moduleImports, bool is64bit)
@@ -400,30 +342,16 @@ internal static class PEImports
             }
         }
 
-        bool is64bit = Is64bit();
-
-        var newImportsSize = CalculateImportDirectorySize(moduleImports, is64bit);
-        var newImportsAddr = FindAndAllocateNearBase(processHandle, imageBase, (uint)newImportsSize.TotalSize);
-        if (newImportsAddr == nuint.Zero)
-        {
-            throw new Exception("Failed to allocate memory for new import data");
-        }
-
-        uint firstThunksRva = (uint)(newImportsAddr - imageBase);
-        uint origFirstThunksRva = firstThunksRva + (uint)newImportsSize.ThunksArraySize;
-        uint importDescTableRva = origFirstThunksRva + (uint)newImportsSize.ThunksArraySize;
-        uint stringsRva = importDescTableRva + (uint)newImportsSize.ImportDescTableSize;
-
         uint WriteStringToRemoteProcessMemory(uint rva, string s)
         {
             unsafe
             {
                 var bytes = Encoding.ASCII.GetBytes(s);
-                fixed (void* pBytes = bytes)
+                fixed (void* bytesPtr = bytes)
                 {
                     // wirtual memory allocated by VirtualAllocEx is set to zero, thus we don't need
                     // to add the zero byte here
-                    if (!PInvoke.WriteProcessMemory(processHandle, (void*)(newImportsAddr + rva), pBytes, (uint)bytes.Length, null))
+                    if (!PInvoke.WriteProcessMemory(processHandle, (void*)(imageBase + rva), bytesPtr, (uint)bytes.Length, null))
                     {
                         throw new Win32Exception(Marshal.GetLastPInvokeError(), $"Failed to write string data: '{s}'");
                     }
@@ -451,9 +379,9 @@ internal static class PEImports
 
                 unsafe
                 {
-                    fixed (void* pNativeThunks = nativeThunks)
+                    fixed (void* nativeThunksPtr = nativeThunks)
                     {
-                        if (!PInvoke.WriteProcessMemory(processHandle, (void*)(newImportsAddr + rva), pNativeThunks,
+                        if (!PInvoke.WriteProcessMemory(processHandle, (void*)(imageBase + rva), nativeThunksPtr,
                             (uint)Marshal.SizeOf<IMAGE_THUNK_DATA64>() * ((uint)nativeThunks.Length + 1 /* ending zero thunk */), null))
                         {
                             throw new Win32Exception(Marshal.GetLastPInvokeError(), "Failed to write thunk data");
@@ -480,9 +408,9 @@ internal static class PEImports
 
                 unsafe
                 {
-                    fixed (void* pNativeThunks = nativeThunks)
+                    fixed (void* nativeThunksPtr = nativeThunks)
                     {
-                        if (!PInvoke.WriteProcessMemory(processHandle, (void*)(newImportsAddr + rva), pNativeThunks,
+                        if (!PInvoke.WriteProcessMemory(processHandle, (void*)(imageBase + rva), nativeThunksPtr,
                             (uint)Marshal.SizeOf<IMAGE_THUNK_DATA32>() * ((uint)nativeThunks.Length + 1 /* ending zero thunk */), null))
                         {
                             throw new Win32Exception(Marshal.GetLastPInvokeError(), "Failed to write thunk data");
@@ -494,6 +422,48 @@ internal static class PEImports
             }
             return rva;
         }
+
+        uint WriteImportDescriptorsToMemory(uint rva, ModuleImport[] moduleImports)
+        {
+            var importDescs = moduleImports.Select(moduleImport => new IMAGE_IMPORT_DESCRIPTOR
+            {
+                Anonymous = new IMAGE_IMPORT_DESCRIPTOR._Anonymous_e__Union
+                {
+                    OriginalFirstThunk = moduleImport.OriginalFirstThunkRva
+                },
+                FirstThunk = moduleImport.FirstThunkRva,
+                Name = moduleImport.DllNameRva
+            }).ToArray();
+
+            unsafe
+            {
+                fixed (void* importDescPtr = importDescs)
+                {
+                    if (!PInvoke.WriteProcessMemory(processHandle, (void*)(imageBase + rva), importDescPtr,
+                        (uint)Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>() * ((uint)importDescs.Length + 1 /* ending zero import */), null))
+                    {
+                        throw new Win32Exception(Marshal.GetLastPInvokeError(), "Failed to write import descriptors");
+                    }
+                }
+            }
+
+            rva += (uint)Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>() * ((uint)importDescs.Length + 1 /* ending zero import */);
+            return rva;
+        }
+
+        bool is64bit = Is64bit();
+
+        var newImportsSize = CalculateImportDirectorySize(moduleImports, is64bit);
+        var newImportsAddr = FindAndAllocateNearBase(processHandle, imageBase, (uint)newImportsSize.TotalSize);
+        if (newImportsAddr == nuint.Zero)
+        {
+            throw new Exception("Failed to allocate memory for new import data");
+        }
+
+        uint firstThunksRva = (uint)(newImportsAddr - imageBase);
+        uint origFirstThunksRva = firstThunksRva + (uint)newImportsSize.ThunksArraySize;
+        uint importDescTableRva = origFirstThunksRva + (uint)newImportsSize.ThunksArraySize;
+        uint stringsRva = importDescTableRva + (uint)newImportsSize.ImportDescTableSize;
 
         for (var i = 0; i < moduleImports.Length; i++)
         {
@@ -546,8 +516,6 @@ internal static class PEImports
         }
 
         // write import descriptors
-        // FIXME
+        WriteImportDescriptorsToMemory(importDescTableRva, moduleImports);
     }
-}
-
 }
