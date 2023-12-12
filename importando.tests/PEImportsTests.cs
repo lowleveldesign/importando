@@ -34,11 +34,11 @@ public class PEImportsTests
     public void TestParsingUpdates()
     {
         string[] arguments = ["Test1.dll:Test2.dll"];
-        Assert.That(() => PEImports.ParseImportUpdates(arguments), Throws.TypeOf<ArgumentException>());
+        Assert.That(() => ProgramArgs.ParseImportUpdates(arguments), Throws.TypeOf<ArgumentException>());
         arguments = ["Test1.dll!Function:Test2.dll"];
-        Assert.That(() => PEImports.ParseImportUpdates(arguments), Throws.TypeOf<ArgumentException>());
+        Assert.That(() => ProgramArgs.ParseImportUpdates(arguments), Throws.TypeOf<ArgumentException>());
         arguments = ["Test1.dll!Function:Test2.dll:Test3"];
-        Assert.That(() => PEImports.ParseImportUpdates(arguments), Throws.TypeOf<ArgumentException>());
+        Assert.That(() => ProgramArgs.ParseImportUpdates(arguments), Throws.TypeOf<ArgumentException>());
 
         arguments = [
             "Test1.dll!Function13",
@@ -49,9 +49,9 @@ public class PEImportsTests
             "test1.dll#13:test2.dll#21",
             "test1.DLL#13:test3.dll#31"
         ];
-        var (forwardings, importUpdates) = PEImports.ParseImportUpdates(arguments);
+        var (forwards, importUpdates) = ProgramArgs.ParseImportUpdates(arguments);
 
-        Assert.That(importUpdates.Length, Is.EqualTo(arguments.Length));
+        Assert.That(importUpdates, Has.Length.EqualTo(arguments.Length));
         int ind = 0;
         Assert.That(importUpdates[ind++], Is.EqualTo(new ImportUpdate(
             "TEST1.DLL!Function13", "TEST1.DLL", new FunctionImportByName(0, 0, "Function13"))));
@@ -70,11 +70,11 @@ public class PEImportsTests
         Assert.That(ind, Is.EqualTo(arguments.Length));
 
         ind = 0;
-        Assert.That(forwardings[ind++], Is.EqualTo(("TEST1.DLL!Function11", "TEST2.DLL!Function21")));
-        Assert.That(forwardings[ind++], Is.EqualTo(("TEST2.DLL!Function21", "TEST1.DLL!Function11")));
-        Assert.That(forwardings[ind++], Is.EqualTo(("TEST1.DLL#13", "TEST2.DLL#21")));
-        Assert.That(forwardings[ind++], Is.EqualTo(("TEST1.DLL#13", "TEST3.DLL#31")));
-        Assert.That(ind, Is.EqualTo(forwardings.Length));
+        Assert.That(forwards[ind++], Is.EqualTo(("TEST1.DLL!Function11", "TEST2.DLL!Function21")));
+        Assert.That(forwards[ind++], Is.EqualTo(("TEST2.DLL!Function21", "TEST1.DLL!Function11")));
+        Assert.That(forwards[ind++], Is.EqualTo(("TEST1.DLL#13", "TEST2.DLL#21")));
+        Assert.That(forwards[ind++], Is.EqualTo(("TEST1.DLL#13", "TEST3.DLL#31")));
+        Assert.That(ind, Is.EqualTo(forwards.Length));
     }
 
     [Test]
@@ -104,8 +104,8 @@ public class PEImportsTests
             "test1.DLL!Function18:test3.dll!Function31", // not existing
             "test1.dll#14:test4.dll#41" // not existing
         ];
-        var (forwardings, importUpdates) = PEImports.ParseImportUpdates(arguments);
-        Assert.That(() => PEImports.PrepareNewModuleImports(existingImports, importUpdates, forwardings),
+        var (forwards, importUpdates) = ProgramArgs.ParseImportUpdates(arguments);
+        Assert.That(() => PEImports.PrepareNewModuleImports(existingImports, importUpdates, forwards),
             Throws.TypeOf<ArgumentException>());
 
         arguments = [
@@ -117,9 +117,9 @@ public class PEImportsTests
             "test1.DLL#13:test3.dll#31",
             "test1.DLL!Function12:test3.dll#33",
         ];
-        (forwardings, importUpdates) = PEImports.ParseImportUpdates(arguments);
+        (forwards, importUpdates) = ProgramArgs.ParseImportUpdates(arguments);
 
-        var newImports = PEImports.PrepareNewModuleImports(existingImports, importUpdates, forwardings);
+        var newImports = PEImports.PrepareNewModuleImports(existingImports, importUpdates, forwards);
         var ind = 0;
         Assert.That(newImports[ind].DllName, Is.EqualTo("TEST0.DLL"));
         Assert.That(newImports[ind].DllNameRva, Is.EqualTo(10));
@@ -154,7 +154,7 @@ public class PEImportsTests
             }));
         ind++;
 
-        Assert.That(newImports.Length, Is.EqualTo(ind));
+        Assert.That(newImports, Has.Length.EqualTo(ind));
     }
 
     [Test]

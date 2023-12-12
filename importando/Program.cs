@@ -1,15 +1,18 @@
 ﻿using importando;
 using System.ComponentModel;
+using System.Diagnostics;
+using System.Reflection.PortableExecutable;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Windows.Win32;
 using Windows.Win32.Foundation;
 using Windows.Win32.System.Diagnostics.Debug;
 using Windows.Win32.System.Threading;
+using Microsoft.Win32.SafeHandles;
 
 [assembly: InternalsVisibleTo("importando.tests")]
 
-using CancellationTokenSource cts = new CancellationTokenSource();
+using CancellationTokenSource cts = new();
 
 Console.CancelKeyPress += (_, e) =>
 {
@@ -21,7 +24,7 @@ var parsedArgs = ProgramArgs.ParseArgs(["v", "h", "help"], args);
 if (parsedArgs.ContainsKey("h") || parsedArgs.ContainsKey("help"))
 {
     Console.WriteLine("""
-importando - a tool for modifying imports on a process start
+importando - a tool for modifying PE imports on a process start
 
 Copyright (C) 2023 Sebastian Solnica (https://wtrace.net)
 
@@ -52,8 +55,7 @@ HANDLE processHandle = HANDLE.Null;
 
 try
 {
-    var importUpdates = ProgramArgs.ParseImportUpdates(parsedArgs["i"].ToArray());
-
+    var (forwards, importUpdates) = ProgramArgs.ParseImportUpdates([.. parsedArgs["i"]]);
 
     uint pid;
     unsafe
@@ -69,12 +71,12 @@ try
                 &startupInfo, &processInformation);
             if (!res)
             {
-                Marshal.ThrowExceptionForHR(Marshal.GetHRForLastWin32Error());
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), $"{nameof(PInvoke.CreateProcess)} error");
             }
 
             if (!PInvoke.DebugSetProcessKillOnExit(false))
             {
-                throw new Win32Exception();
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), $"{nameof(PInvoke.DebugSetProcessKillOnExit)} error");
             }
 
             pid = processInformation.dwProcessId;
@@ -91,15 +93,24 @@ try
             switch (debugEvent.dwDebugEventCode)
             {
                 case DEBUG_EVENT_CODE.CREATE_PROCESS_DEBUG_EVENT:
-                    pid = debugEvent.dwProcessId;
-                    processHandle = debugEvent.u.CreateProcessInfo.hProcess;
+                    Debug.Assert(pid == debugEvent.dwProcessId);
+                    var createProcessInfo = debugEvent.u.CreateProcessInfo;
+                    processHandle = createProcessInfo.hProcess;
                     logger.WriteLine($"CreateProcess: {debugEvent.dwProcessId}");
                     // FIXME: perform the modifications
                     break;
                 case DEBUG_EVENT_CODE.EXCEPTION_DEBUG_EVENT:
                     // first breakpoint exception is the process breakpoint - it happens when loader finished its initial
-                    // work and IAT is already resolved
-                    logger.WriteLine($"Exception: {debugEvent.u.Exception.ExceptionRecord.ExceptionCode.Value:x}");
+                    // work and thunks are resolved
+                    if (debugEvent.u.Exception.ExceptionRecord.ExceptionCode == NTSTATUS.STATUS_BREAKPOINT)
+                    {
+                        UpdateForwardedImports();
+                        cts.Cancel();
+                    }
+                    else
+                    {
+                        logger.WriteLine($"Exception: {debugEvent.u.Exception.ExceptionRecord.ExceptionCode.Value:x}");
+                    }
                     break;
                 case DEBUG_EVENT_CODE.EXIT_PROCESS_DEBUG_EVENT:
                     cts.Cancel();
@@ -111,7 +122,7 @@ try
             if (!PInvoke.ContinueDebugEvent(debugEvent.dwProcessId,
                 debugEvent.dwThreadId, NTSTATUS.DBG_EXCEPTION_NOT_HANDLED))
             {
-                throw new Win32Exception();
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), $"{nameof(PInvoke.ContinueDebugEvent)} error");
             }
         }
     }
@@ -133,6 +144,26 @@ finally
     }
 }
 
+static void UpdateProcessImports(HANDLE processHandle, HANDLE imageHandle, uint imageBase,
+    ImportUpdate[] importUpdates, (string ForwardFrom, string ForwardTo)[] forwards)
+{
+    // it is OK to close the handle after we finish reading the image data
+    using var pereader = new PEReader(new FileStream(new SafeFileHandle(imageHandle, true), FileAccess.Read));
+
+    var existingImports = PEImports.ReadModuleImports(pereader);
+
+    var newImports = PEImports.PrepareNewModuleImports(existingImports, importUpdates, forwards);
+
+    var newImportTableDir = PEImports.UpdateImportsDirectory(processHandle, pereader.Is64Bit(), imageBase, newImports);
+
+    // FIXME: update the import table directory
+}
+
+static void UpdateForwardedImports()
+{
+    // FIXME: update the forwarded imports RVAs
+}
+
 static DEBUG_EVENT? WaitForDebugEvent(uint timeout)
 {
     if (!PInvoke.WaitForDebugEvent(out var debugEvent, timeout))
@@ -143,7 +174,7 @@ static DEBUG_EVENT? WaitForDebugEvent(uint timeout)
             return null;
         }
 
-        throw new Win32Exception(err);
+        throw new Win32Exception(err, $"{nameof(PInvoke.WaitForDebugEvent)} error");
     }
     else
     {

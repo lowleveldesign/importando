@@ -40,9 +40,9 @@ record ModuleImport(string DllName, uint DllNameRva, uint OriginalFirstThunkRva,
     }
 }
 
-record NewImportDataSize(int ThunksArraySize, int StringsArraySize, int ImportDescTableSize)
+record NewImportDataSize(uint ThunksArraySize, uint StringsArraySize, uint ImportDescTableSize)
 {
-    public int TotalSize => 2 * ThunksArraySize /* orig first and first */ +
+    public uint TotalSize => 2 * ThunksArraySize /* orig first and first */ +
         StringsArraySize + ImportDescTableSize;
 }
 
@@ -50,10 +50,10 @@ internal static class PEImports
 {
     static readonly int NameOffset = Marshal.OffsetOf<IMAGE_IMPORT_BY_NAME>("Name").ToInt32();
 
-    public static unsafe ModuleImport[] ReadModuleImports(string modulePath)
-    {
-        using var pereader = new PEReader(File.OpenRead(modulePath));
+    public static bool Is64Bit(this PEReader pereader) => pereader.PEHeaders.PEHeader!.Magic == PEMagic.PE32Plus;
 
+    public static unsafe ModuleImport[] ReadModuleImports(PEReader pereader)
+    {
         unsafe IFunctionImport GetFunctionImport(bool isOrdinal, uint rva)
         {
             if (rva == 0)
@@ -104,7 +104,7 @@ internal static class PEImports
             return [.. thunks];
         }
 
-        var is64Bit = pereader.PEHeaders.PEHeader!.Magic == PEMagic.PE32Plus;
+        var is64Bit = pereader.Is64Bit();
         var importTableDirectory = pereader.PEHeaders.PEHeader!.ImportTableDirectory;
 
         var importDirEntryData = pereader.GetSectionData(importTableDirectory.RelativeVirtualAddress);
@@ -197,7 +197,7 @@ internal static class PEImports
     }
 
     public static ModuleImport[] PrepareNewModuleImports(ModuleImport[] existingImports, ImportUpdate[] updates,
-        (string ForwardFrom, string ForwardTo)[] forwardings)
+        (string ForwardFrom, string ForwardTo)[] forwards)
     {
         unsafe string GetFunctionImportName(string dllName, IFunctionImport import)
         {
@@ -210,8 +210,8 @@ internal static class PEImports
             };
         }
 
-        bool IsForwardedFrom(string importName) => Array.Exists(forwardings, f => f.ForwardFrom == importName);
-        bool IsForwardedTo(string importName) => Array.Exists(forwardings, f => f.ForwardTo == importName);
+        bool IsForwardedFrom(string importName) => Array.Exists(forwards, f => f.ForwardFrom == importName);
+        bool IsForwardedTo(string importName) => Array.Exists(forwards, f => f.ForwardTo == importName);
 
         var imports = new List<ModuleImport>();
         var dllNames = updates.Select(u => u.DllName).ToHashSet();
@@ -240,7 +240,7 @@ internal static class PEImports
                         if (IsForwardedTo(importName))
                         {
                             throw new ArgumentException(
-                                $"Forwarded import '{importName}' can't be used as a forwarding target");
+                                $"Forwarded import '{importName}' can't be used as a forward target");
                         }
                     }
                     else
@@ -292,29 +292,29 @@ internal static class PEImports
     public static NewImportDataSize CalculateImportDirectorySize(ModuleImport[] moduleImports, bool is64bit)
     {
         var (thunksArraySize, stringsArraySize, importDescTableSize) =
-            moduleImports.Aggregate((0, 0, 0), (acc, moduleImport) =>
+            moduleImports.Aggregate((0u, 0u, 0u), (acc, moduleImport) =>
         {
             var (thunksArraySize, stringsArraySize, importDescTableSize) = acc;
 
             if (moduleImport.DllNameRva == 0)
             {
-                stringsArraySize += Encoding.ASCII.GetByteCount(moduleImport.DllName) + 1 /* null byte */;
+                stringsArraySize += (uint)Encoding.ASCII.GetByteCount(moduleImport.DllName) + 1 /* null byte */;
             }
 
-            importDescTableSize += Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>();
+            importDescTableSize += (uint)Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>();
 
             // thunks (only the ones that we need to allocate)
             if (moduleImport.FirstThunkRva == 0)
             {
-                thunksArraySize = (moduleImport.FirstThunks.Length + 1 /* ending zero import */) *
-                    (is64bit ? Marshal.SizeOf<IMAGE_THUNK_DATA64>() : Marshal.SizeOf<IMAGE_THUNK_DATA32>());
+                thunksArraySize = (uint)((moduleImport.FirstThunks.Length + 1 /* ending zero import */) *
+                    (is64bit ? Marshal.SizeOf<IMAGE_THUNK_DATA64>() : Marshal.SizeOf<IMAGE_THUNK_DATA32>()));
 
-                stringsArraySize += moduleImport.FirstThunks.Aggregate(0, (acc, thunk) =>
+                stringsArraySize += moduleImport.FirstThunks.Aggregate(0u, (acc, thunk) =>
                 {
                     return thunk.Import switch
                     {
-                        FunctionImportByName imp when imp.Rva == 0 => acc + Marshal.SizeOf(imp.Hint) +
-                                Encoding.ASCII.GetByteCount(imp.FunctionName) + 1 /* null byte */,
+                        FunctionImportByName imp when imp.Rva == 0 => acc + (uint)Marshal.SizeOf(imp.Hint) +
+                                (uint)Encoding.ASCII.GetByteCount(imp.FunctionName) + 1 /* null byte */,
                         _ => acc
                     };
                 });
@@ -324,24 +324,12 @@ internal static class PEImports
         });
 
         return new NewImportDataSize(thunksArraySize, stringsArraySize,
-            importDescTableSize + Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>() /* zero import */);
+            importDescTableSize + (uint)Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>() /* zero import */);
     }
 
-    public static void UpdateImportsDirectory(HANDLE processHandle, uint imageBase, ModuleImport[] moduleImports)
+    public static (uint rva, uint size, (uint from, uint to)[] forwards) UpdateImportsDirectory(
+        HANDLE processHandle, bool is64bit, uint imageBase, ModuleImport[] moduleImports)
     {
-        bool Is64bit()
-        {
-            unsafe
-            {
-                BOOL isWow64 = false;
-                return Environment.Is64BitOperatingSystem switch
-                {
-                    true => PInvoke.IsWow64Process(processHandle, &isWow64) ? !isWow64 : true,
-                    false => false
-                };
-            }
-        }
-
         uint WriteStringToRemoteProcessMemory(uint rva, string s)
         {
             unsafe
@@ -360,7 +348,7 @@ internal static class PEImports
             }
         };
 
-        uint WriteThunksToMemory(uint rva, bool is64bit, FunctionThunk[] thunks)
+        uint WriteThunksToMemory(uint rva, FunctionThunk[] thunks)
         {
             if (is64bit)
             {
@@ -371,7 +359,7 @@ internal static class PEImports
                     {
                         u1 = new IMAGE_THUNK_DATA64._u1_e__Union
                         {
-                            Ordinal = (ulong)imp.Ordinal | PInvoke.IMAGE_ORDINAL_FLAG64
+                            Ordinal = imp.Ordinal | PInvoke.IMAGE_ORDINAL_FLAG64
                         }
                     },
                     _ => throw new ArgumentException("Unsupported thunk type")
@@ -451,19 +439,17 @@ internal static class PEImports
             return rva;
         }
 
-        bool is64bit = Is64bit();
-
         var newImportsSize = CalculateImportDirectorySize(moduleImports, is64bit);
-        var newImportsAddr = FindAndAllocateNearBase(processHandle, imageBase, (uint)newImportsSize.TotalSize);
+        var newImportsAddr = FindAndAllocateNearBase(processHandle, imageBase, newImportsSize.TotalSize);
         if (newImportsAddr == nuint.Zero)
         {
             throw new Exception("Failed to allocate memory for new import data");
         }
 
         uint firstThunksRva = (uint)(newImportsAddr - imageBase);
-        uint origFirstThunksRva = firstThunksRva + (uint)newImportsSize.ThunksArraySize;
-        uint importDescTableRva = origFirstThunksRva + (uint)newImportsSize.ThunksArraySize;
-        uint stringsRva = importDescTableRva + (uint)newImportsSize.ImportDescTableSize;
+        uint origFirstThunksRva = firstThunksRva + newImportsSize.ThunksArraySize;
+        uint importDescTableRva = origFirstThunksRva + newImportsSize.ThunksArraySize;
+        uint stringsRva = importDescTableRva + newImportsSize.ImportDescTableSize;
 
         for (var i = 0; i < moduleImports.Length; i++)
         {
@@ -500,8 +486,8 @@ internal static class PEImports
                         firstThunks[j] = new(imp with { Rva = rva });
                     }
                 }
-                var newFirstThunksRva = WriteThunksToMemory(firstThunksRva, is64bit, firstThunks);
-                var newOrigFirstThunksRva = WriteThunksToMemory(origFirstThunksRva, is64bit, firstThunks);
+                var newFirstThunksRva = WriteThunksToMemory(firstThunksRva, firstThunks);
+                var newOrigFirstThunksRva = WriteThunksToMemory(origFirstThunksRva, firstThunks);
 
                 moduleImports[i] = moduleImport with
                 {
@@ -517,5 +503,7 @@ internal static class PEImports
 
         // write import descriptors
         WriteImportDescriptorsToMemory(importDescTableRva, moduleImports);
+
+        return ((uint)(newImportsAddr - imageBase), newImportsSize.TotalSize);
     }
 }
