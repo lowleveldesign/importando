@@ -199,7 +199,7 @@ internal static class PEImports
     public static ModuleImport[] PrepareNewModuleImports(ModuleImport[] existingImports, ImportUpdate[] updates,
         (string ForwardFrom, string ForwardTo)[] forwards)
     {
-        unsafe string GetFunctionImportName(string dllName, IFunctionImport import)
+        string GetFunctionImportName(string dllName, IFunctionImport import)
         {
             return import switch
             {
@@ -255,8 +255,8 @@ internal static class PEImports
                 // new thunks
                 foreach (var updateImportName in updateImportNames)
                 {
-                    // we only add imports that are not forwarded are added - why would
-                    // you want to forward an import that is not used?
+                    // only imports that are not forwarded are added - it does
+                    // not make sense to forward a newly added import
                     if (IsForwardedFrom(updateImportName))
                     {
                         throw new ArgumentException($"A non-existing import '{updateImportName}' can't be forwarded");
@@ -327,8 +327,8 @@ internal static class PEImports
             importDescTableSize + (uint)Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>() /* zero import */);
     }
 
-    public static (uint rva, uint size, (uint from, uint to)[] forwards) UpdateImportsDirectory(
-        HANDLE processHandle, bool is64bit, uint imageBase, ModuleImport[] moduleImports)
+    public static (uint Rva, uint Size) UpdateImportsDirectory(
+        HANDLE processHandle, bool is64bit, nuint imageBase, ModuleImport[] moduleImports)
     {
         uint WriteStringToRemoteProcessMemory(uint rva, string s)
         {
@@ -428,7 +428,7 @@ internal static class PEImports
                 fixed (void* importDescPtr = importDescs)
                 {
                     if (!PInvoke.WriteProcessMemory(processHandle, (void*)(imageBase + rva), importDescPtr,
-                        (uint)Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>() * ((uint)importDescs.Length + 1 /* ending zero import */), null))
+                        (uint)Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>() * ((uint)importDescs.Length), null))
                     {
                         throw new Win32Exception(Marshal.GetLastPInvokeError(), "Failed to write import descriptors");
                     }
@@ -439,17 +439,17 @@ internal static class PEImports
             return rva;
         }
 
-        var newImportsSize = CalculateImportDirectorySize(moduleImports, is64bit);
-        var newImportsAddr = FindAndAllocateNearBase(processHandle, imageBase, newImportsSize.TotalSize);
-        if (newImportsAddr == nuint.Zero)
+        var newImportsDirSize = CalculateImportDirectorySize(moduleImports, is64bit);
+        var newImportsDirAddr = FindAndAllocateNearBase(processHandle, imageBase, newImportsDirSize.TotalSize);
+        if (newImportsDirAddr == nuint.Zero)
         {
             throw new Exception("Failed to allocate memory for new import data");
         }
 
-        uint firstThunksRva = (uint)(newImportsAddr - imageBase);
-        uint origFirstThunksRva = firstThunksRva + newImportsSize.ThunksArraySize;
-        uint importDescTableRva = origFirstThunksRva + newImportsSize.ThunksArraySize;
-        uint stringsRva = importDescTableRva + newImportsSize.ImportDescTableSize;
+        uint firstThunksRva = (uint)(newImportsDirAddr - imageBase);
+        uint origFirstThunksRva = firstThunksRva + newImportsDirSize.ThunksArraySize;
+        uint importDescTableRva = origFirstThunksRva + newImportsDirSize.ThunksArraySize;
+        uint stringsRva = importDescTableRva + newImportsDirSize.ImportDescTableSize;
 
         for (var i = 0; i < moduleImports.Length; i++)
         {
@@ -504,6 +504,6 @@ internal static class PEImports
         // write import descriptors
         WriteImportDescriptorsToMemory(importDescTableRva, moduleImports);
 
-        return ((uint)(newImportsAddr - imageBase), newImportsSize.TotalSize);
+        return ((uint)(newImportsDirAddr - imageBase), newImportsDirSize.TotalSize);
     }
 }

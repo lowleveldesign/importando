@@ -5,6 +5,7 @@ using System.Reflection.PortableExecutable;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Windows.Win32;
+using Windows.Win32.System.Memory;
 using Windows.Win32.Foundation;
 using Windows.Win32.System.Diagnostics.Debug;
 using Windows.Win32.System.Threading;
@@ -48,19 +49,24 @@ Examples:
 """);
     return;
 }
+
+if (!parsedArgs.TryGetValue("", out var freeArgs))
+{
+    Console.WriteLine("ERROR: no executable specified");
+    return;
+}
+
 TextWriter logger = (parsedArgs.ContainsKey("v") || parsedArgs.ContainsKey("verbose")) ?
     Console.Out : TextWriter.Null;
 
-HANDLE processHandle = HANDLE.Null;
-
 try
 {
-    var (forwards, importUpdates) = ProgramArgs.ParseImportUpdates([.. parsedArgs["i"]]);
+    var (forwards, importUpdates) = parsedArgs.TryGetValue("i", out var updateArgs) ? ProgramArgs.ParseImportUpdates(updateArgs) : ([], []);
 
     uint pid;
     unsafe
     {
-        var commandLine = "\"" + string.Join("\" \"", args) + "\"\0";
+        var commandLine = "\"" + string.Join("\" \"", freeArgs) + "\"\0";
         fixed (char* commandLinePtr = commandLine)
         {
             var startupInfo = new STARTUPINFOW() { cb = (uint)Marshal.SizeOf<STARTUPINFOW>() };
@@ -86,6 +92,11 @@ try
         }
     }
 
+    HANDLE processHandle = HANDLE.Null;
+    nuint imageBase = 0;
+    ModuleImport[] originalImports = [];
+    ModuleImport[] newImports = [];
+
     while (!cts.Token.IsCancellationRequested)
     {
         if (WaitForDebugEvent(1000) is { } debugEvent)
@@ -95,23 +106,42 @@ try
                 case DEBUG_EVENT_CODE.CREATE_PROCESS_DEBUG_EVENT:
                     Debug.Assert(pid == debugEvent.dwProcessId);
                     var createProcessInfo = debugEvent.u.CreateProcessInfo;
+
                     processHandle = createProcessInfo.hProcess;
+                    unsafe { imageBase = (nuint)createProcessInfo.lpBaseOfImage; }
+
                     logger.WriteLine($"CreateProcess: {debugEvent.dwProcessId}");
-                    // FIXME: perform the modifications
+
+                    (originalImports, newImports) = UpdateProcessImports(processHandle,
+                        createProcessInfo.hFile, imageBase, importUpdates, forwards);
                     break;
+
                 case DEBUG_EVENT_CODE.EXCEPTION_DEBUG_EVENT:
-                    // first breakpoint exception is the process breakpoint - it happens when loader finished its initial
-                    // work and thunks are resolved
                     if (debugEvent.u.Exception.ExceptionRecord.ExceptionCode == NTSTATUS.STATUS_BREAKPOINT)
                     {
-                        UpdateForwardedImports();
+                        // first breakpoint exception is the process breakpoint - it happens when loader finished its initial
+                        // work and thunks are resolved
+                        Debug.Assert(imageBase != 0 && !processHandle.IsNull);
+                        UpdateForwardedImports(processHandle, imageBase, originalImports, newImports, forwards);
                         cts.Cancel();
                     }
                     else
                     {
-                        logger.WriteLine($"Exception: {debugEvent.u.Exception.ExceptionRecord.ExceptionCode.Value:x}");
+                        logger.WriteLine($"Unexpected exception: {debugEvent.u.Exception.ExceptionRecord.ExceptionCode.Value:x}");
                     }
                     break;
+
+                case DEBUG_EVENT_CODE.OUTPUT_DEBUG_STRING_EVENT:
+                    var debugString = debugEvent.u.DebugString;
+                    unsafe
+                    {
+                        // the string could be longer than the ushort length, but we don't really care here
+                        var value = ReadRemoteString(processHandle, debugString.lpDebugStringData.Value, 
+                            debugString.nDebugStringLength, debugString.fUnicode != 0);
+                        logger.Write("Debug output: {0}", value);
+                    }
+                    break;
+
                 case DEBUG_EVENT_CODE.EXIT_PROCESS_DEBUG_EVENT:
                     cts.Cancel();
                     break;
@@ -136,17 +166,34 @@ catch (Exception ex)
 {
     Console.WriteLine($"ERROR: {ex}");
 }
-finally
-{
-    if (!processHandle.IsNull)
-    {
-        PInvoke.CloseHandle(processHandle);
-    }
-}
 
-static void UpdateProcessImports(HANDLE processHandle, HANDLE imageHandle, uint imageBase,
-    ImportUpdate[] importUpdates, (string ForwardFrom, string ForwardTo)[] forwards)
+static (ModuleImport[] OriginalImports, ModuleImport[] NewImports) UpdateProcessImports(HANDLE processHandle,
+    HANDLE imageHandle, nuint imageBase, ImportUpdate[] importUpdates, (string ForwardFrom, string ForwardTo)[] forwards)
 {
+    void UpdatePEDirectory(nuint dataDirectoriesRva, IMAGE_DIRECTORY_ENTRY entry, uint rva, uint size)
+    {
+        int IMAGE_DATA_DIRECTORY_SIZE = Marshal.SizeOf<IMAGE_DATA_DIRECTORY>();
+
+        var dataDirectory = new IMAGE_DATA_DIRECTORY { VirtualAddress = rva, Size = size };
+        var addr = imageBase + dataDirectoriesRva + (nuint)((int)entry * IMAGE_DATA_DIRECTORY_SIZE);
+
+        unsafe
+        {
+            PAGE_PROTECTION_FLAGS oldProtection;
+            if (!PInvoke.VirtualProtectEx(processHandle, (void*)addr, (nuint)IMAGE_DATA_DIRECTORY_SIZE,
+                PAGE_PROTECTION_FLAGS.PAGE_READWRITE, &oldProtection))
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), $"{nameof(PInvoke.VirtualProtectEx)} error");
+            }
+            if (!PInvoke.WriteProcessMemory(processHandle, (void*)addr, &dataDirectory, (nuint)IMAGE_DATA_DIRECTORY_SIZE, null))
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), $"{nameof(PInvoke.WriteProcessMemory)} error");
+            }
+            PInvoke.VirtualProtectEx(processHandle, (void*)addr, (nuint)IMAGE_DATA_DIRECTORY_SIZE,
+                               oldProtection, &oldProtection);
+        }
+    }
+
     // it is OK to close the handle after we finish reading the image data
     using var pereader = new PEReader(new FileStream(new SafeFileHandle(imageHandle, true), FileAccess.Read));
 
@@ -154,14 +201,39 @@ static void UpdateProcessImports(HANDLE processHandle, HANDLE imageHandle, uint 
 
     var newImports = PEImports.PrepareNewModuleImports(existingImports, importUpdates, forwards);
 
-    var newImportTableDir = PEImports.UpdateImportsDirectory(processHandle, pereader.Is64Bit(), imageBase, newImports);
+    var is64bit = pereader.Is64Bit();
+    var (importDirRva, importDirSize) = PEImports.UpdateImportsDirectory(processHandle, is64bit, imageBase, newImports);
 
-    // FIXME: update the import table directory
+    nuint dataDirectoriesRva = (nuint)(pereader.PEHeaders.PEHeaderStartOffset +
+        (is64bit ? Marshal.OffsetOf<IMAGE_OPTIONAL_HEADER64>("DataDirectory") : Marshal.OffsetOf<IMAGE_OPTIONAL_HEADER32>("DataDirectory")));
+
+    UpdatePEDirectory(dataDirectoriesRva, IMAGE_DIRECTORY_ENTRY.IMAGE_DIRECTORY_ENTRY_IMPORT, importDirRva, importDirSize);
+    UpdatePEDirectory(dataDirectoriesRva, IMAGE_DIRECTORY_ENTRY.IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT, 0, 0);
+
+    return (existingImports, newImports);
 }
 
-static void UpdateForwardedImports()
+static void UpdateForwardedImports(HANDLE processHandle, nuint imageBase, ModuleImport[] originalImports,
+    ModuleImport[] newImports, (string ForwardFrom, string ForwardTo)[] forwards)
 {
     // FIXME: update the forwarded imports RVAs
+}
+
+unsafe string ReadRemoteString(HANDLE processHandle, byte* addr, int bytesLength, bool isUnicode)
+{
+    unsafe
+    {
+        var buffer = stackalloc byte[bytesLength];
+        if (PInvoke.ReadProcessMemory(processHandle, addr, buffer, (nuint)bytesLength, null))
+        {
+            return isUnicode ? Marshal.PtrToStringUni((nint)buffer, bytesLength / sizeof(ushort)) :
+                Marshal.PtrToStringAnsi((nint)buffer, bytesLength);
+        }
+        else
+        {
+            return "ERROR READING VALUE";
+        }
+    }
 }
 
 static DEBUG_EVENT? WaitForDebugEvent(uint timeout)

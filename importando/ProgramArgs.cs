@@ -22,7 +22,7 @@ internal class ProgramArgs
 
         foreach (var arg in args)
         {
-            if (!firstFreeArgPassed && arg.StartsWith("-", StringComparison.Ordinal))
+            if (!firstFreeArgPassed && arg.StartsWith('-'))
             {
                 var option = arg.TrimStart('-');
                 if (IsFlag(option))
@@ -54,7 +54,7 @@ internal class ProgramArgs
         return result;
     }
 
-    public static ((string ForwardFrom, string ForwardTo)[], ImportUpdate[]) ParseImportUpdates(string[] importUpdates)
+    public static ((string ForwardFrom, string ForwardTo)[], ImportUpdate[]) ParseImportUpdates(IEnumerable<string> importUpdates)
     {
         static ImportUpdate ParseFunctionImport(string s)
         {
@@ -83,9 +83,8 @@ internal class ProgramArgs
         var updates = new Dictionary<string, ImportUpdate>();
         var forwardings = new HashSet<(string, string)>();
 
-        for (int i = 0; i < importUpdates.Length; i++)
+        foreach (var importUpdate in importUpdates)
         {
-            var importUpdate = importUpdates[i];
             var forwarding = importUpdate.Split(':');
             if (forwarding.Length == 1)
             {
