@@ -327,7 +327,7 @@ internal static class PEImports
             importDescTableSize + (uint)Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>() /* zero import */);
     }
 
-    public static (uint Rva, uint Size) UpdateImportsDirectory(
+    public static (uint ImportDirRva, uint ImportDirSize) UpdateImportsDirectory(
         HANDLE processHandle, bool is64bit, nuint imageBase, ModuleImport[] moduleImports)
     {
         uint WriteStringToRemoteProcessMemory(uint rva, string s)
@@ -504,6 +504,6 @@ internal static class PEImports
         // write import descriptors
         WriteImportDescriptorsToMemory(importDescTableRva, moduleImports);
 
-        return ((uint)(newImportsDirAddr - imageBase), newImportsDirSize.TotalSize);
+        return (importDescTableRva, newImportsDirSize.ImportDescTableSize);
     }
 }

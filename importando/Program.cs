@@ -10,6 +10,7 @@ using Windows.Win32.Foundation;
 using Windows.Win32.System.Diagnostics.Debug;
 using Windows.Win32.System.Threading;
 using Microsoft.Win32.SafeHandles;
+using Windows.Win32.System.WindowsProgramming;
 
 [assembly: InternalsVisibleTo("importando.tests")]
 
@@ -94,6 +95,7 @@ try
 
     HANDLE processHandle = HANDLE.Null;
     nuint imageBase = 0;
+    bool is64bit = false;
     ModuleImport[] originalImports = [];
     ModuleImport[] newImports = [];
 
@@ -104,16 +106,23 @@ try
             switch (debugEvent.dwDebugEventCode)
             {
                 case DEBUG_EVENT_CODE.CREATE_PROCESS_DEBUG_EVENT:
-                    Debug.Assert(pid == debugEvent.dwProcessId);
-                    var createProcessInfo = debugEvent.u.CreateProcessInfo;
+                    {
+                        logger.WriteLine($"CreateProcess: {debugEvent.dwProcessId}");
 
-                    processHandle = createProcessInfo.hProcess;
-                    unsafe { imageBase = (nuint)createProcessInfo.lpBaseOfImage; }
+                        Debug.Assert(pid == debugEvent.dwProcessId);
+                        var createProcessInfo = debugEvent.u.CreateProcessInfo;
 
-                    logger.WriteLine($"CreateProcess: {debugEvent.dwProcessId}");
+                        // we are closing hFile handle after we finish reading the image data
+                        using var pereader = new PEReader(new FileStream(
+                            new SafeFileHandle(createProcessInfo.hFile, true), FileAccess.Read));
 
-                    (originalImports, newImports) = UpdateProcessImports(processHandle,
-                        createProcessInfo.hFile, imageBase, importUpdates, forwards);
+                        processHandle = createProcessInfo.hProcess;
+                        is64bit = pereader.Is64Bit();
+                        unsafe { imageBase = (nuint)createProcessInfo.lpBaseOfImage; }
+
+                        (originalImports, newImports) = UpdateProcessImports(processHandle,
+                            pereader, imageBase, importUpdates, forwards);
+                    }
                     break;
 
                 case DEBUG_EVENT_CODE.EXCEPTION_DEBUG_EVENT:
@@ -122,7 +131,7 @@ try
                         // first breakpoint exception is the process breakpoint - it happens when loader finished its initial
                         // work and thunks are resolved
                         Debug.Assert(imageBase != 0 && !processHandle.IsNull);
-                        UpdateForwardedImports(processHandle, imageBase, originalImports, newImports, forwards);
+                        UpdateForwardedImports(processHandle, is64bit, imageBase, originalImports, newImports, forwards);
                         cts.Cancel();
                     }
                     else
@@ -136,7 +145,7 @@ try
                     unsafe
                     {
                         // the string could be longer than the ushort length, but we don't really care here
-                        var value = ReadRemoteString(processHandle, debugString.lpDebugStringData.Value, 
+                        var value = ReadRemoteString(processHandle, debugString.lpDebugStringData.Value,
                             debugString.nDebugStringLength, debugString.fUnicode != 0);
                         logger.Write("Debug output: {0}", value);
                     }
@@ -168,7 +177,7 @@ catch (Exception ex)
 }
 
 static (ModuleImport[] OriginalImports, ModuleImport[] NewImports) UpdateProcessImports(HANDLE processHandle,
-    HANDLE imageHandle, nuint imageBase, ImportUpdate[] importUpdates, (string ForwardFrom, string ForwardTo)[] forwards)
+    PEReader imageReader, nuint imageBase, ImportUpdate[] importUpdates, (string ForwardFrom, string ForwardTo)[] forwards)
 {
     void UpdatePEDirectory(nuint dataDirectoriesRva, IMAGE_DIRECTORY_ENTRY entry, uint rva, uint size)
     {
@@ -194,17 +203,14 @@ static (ModuleImport[] OriginalImports, ModuleImport[] NewImports) UpdateProcess
         }
     }
 
-    // it is OK to close the handle after we finish reading the image data
-    using var pereader = new PEReader(new FileStream(new SafeFileHandle(imageHandle, true), FileAccess.Read));
-
-    var existingImports = PEImports.ReadModuleImports(pereader);
+    var existingImports = PEImports.ReadModuleImports(imageReader);
 
     var newImports = PEImports.PrepareNewModuleImports(existingImports, importUpdates, forwards);
 
-    var is64bit = pereader.Is64Bit();
+    var is64bit = imageReader.Is64Bit();
     var (importDirRva, importDirSize) = PEImports.UpdateImportsDirectory(processHandle, is64bit, imageBase, newImports);
 
-    nuint dataDirectoriesRva = (nuint)(pereader.PEHeaders.PEHeaderStartOffset +
+    nuint dataDirectoriesRva = (nuint)(imageReader.PEHeaders.PEHeaderStartOffset +
         (is64bit ? Marshal.OffsetOf<IMAGE_OPTIONAL_HEADER64>("DataDirectory") : Marshal.OffsetOf<IMAGE_OPTIONAL_HEADER32>("DataDirectory")));
 
     UpdatePEDirectory(dataDirectoriesRva, IMAGE_DIRECTORY_ENTRY.IMAGE_DIRECTORY_ENTRY_IMPORT, importDirRva, importDirSize);
@@ -213,10 +219,64 @@ static (ModuleImport[] OriginalImports, ModuleImport[] NewImports) UpdateProcess
     return (existingImports, newImports);
 }
 
-static void UpdateForwardedImports(HANDLE processHandle, nuint imageBase, ModuleImport[] originalImports,
-    ModuleImport[] newImports, (string ForwardFrom, string ForwardTo)[] forwards)
+static void UpdateForwardedImports(HANDLE processHandle, bool is64bit, nuint imageBase,
+    ModuleImport[] originalImports, ModuleImport[] newImports, (string ForwardFrom, string ForwardTo)[] forwards)
 {
-    // FIXME: update the forwarded imports RVAs
+    int thunkSize = is64bit ? Marshal.SizeOf<IMAGE_THUNK_DATA64>() : Marshal.SizeOf<IMAGE_THUNK_DATA32>();
+
+    uint GetThunkRva(ModuleImport[] moduleImports, string importName)
+    {
+        var (dllName, functionOrOrdinal) = importName.IndexOfAny(['!', '#']) switch
+        {
+            -1 => throw new InvalidOperationException("Critical error - invalid import name"),
+            var i => (importName[..i], importName[(i + 1)..])
+        };
+
+        var mi = moduleImports.First(mi => mi.DllName == dllName);
+
+        var thunkIndex = Array.FindIndex(mi.FirstThunks, thunk => thunk.Import switch
+        {
+            FunctionImportByName { FunctionName: var name } => name == functionOrOrdinal,
+            FunctionImportByOrdinal { Ordinal: var ordinal } => ordinal.ToString() == functionOrOrdinal,
+            _ => false
+        });
+
+        return mi.FirstThunkRva + (uint)(thunkIndex * thunkSize);
+    }
+
+    void CopyThunkValues(uint fromRva, uint toRva)
+    {
+        unsafe
+        {
+            var buffer = stackalloc byte[thunkSize];
+            if (!PInvoke.ReadProcessMemory(processHandle, (void*)(imageBase + fromRva), buffer, (nuint)thunkSize, null))
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), $"{nameof(PInvoke.ReadProcessMemory)} error when reading thunk");
+            }
+
+            void *toAddr = (void*)(imageBase + toRva);
+            PAGE_PROTECTION_FLAGS oldProtection;
+            if (!PInvoke.VirtualProtectEx(processHandle, toAddr, (nuint)thunkSize, PAGE_PROTECTION_FLAGS.PAGE_READWRITE, &oldProtection))
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), $"{nameof(PInvoke.VirtualProtectEx)} error when changing thunk protection");
+            }
+            if (!PInvoke.WriteProcessMemory(processHandle, toAddr, buffer, (nuint)thunkSize, null))
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError(), $"{nameof(PInvoke.WriteProcessMemory)} error when writing thunk");
+            }
+            PInvoke.VirtualProtectEx(processHandle, toAddr, (nuint)thunkSize, oldProtection, &oldProtection);
+        }
+    }
+
+    foreach ((string forwardFrom, string forwardTo) in forwards)
+    {
+        var originalThunkRva = GetThunkRva(originalImports, forwardFrom);
+        var newThunkRva = GetThunkRva(newImports, forwardTo);
+
+        // new thunk should be resolved by now, so we may copy its value to the original place
+        // that could be referenced by application code
+        CopyThunkValues(newThunkRva, originalThunkRva);
+    }
 }
 
 unsafe string ReadRemoteString(HANDLE processHandle, byte* addr, int bytesLength, bool isUnicode)
