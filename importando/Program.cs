@@ -96,6 +96,8 @@ try
     HANDLE processHandle = HANDLE.Null;
     nuint imageBase = 0;
     bool is64bit = false;
+    bool isWow64 = false;
+
     ModuleImport[] originalImports = [];
     ModuleImport[] newImports = [];
 
@@ -118,6 +120,7 @@ try
 
                         processHandle = createProcessInfo.hProcess;
                         is64bit = pereader.Is64Bit();
+                        isWow64 = Environment.Is64BitProcess && !is64bit;
                         unsafe { imageBase = (nuint)createProcessInfo.lpBaseOfImage; }
 
                         (originalImports, newImports) = UpdateProcessImports(processHandle,
@@ -126,7 +129,8 @@ try
                     break;
 
                 case DEBUG_EVENT_CODE.EXCEPTION_DEBUG_EVENT:
-                    if (debugEvent.u.Exception.ExceptionRecord.ExceptionCode == NTSTATUS.STATUS_BREAKPOINT)
+                    if (debugEvent.u.Exception.ExceptionRecord.ExceptionCode == (
+                        isWow64 ? NTSTATUS.STATUS_WX86_BREAKPOINT : NTSTATUS.STATUS_BREAKPOINT))
                     {
                         // first breakpoint exception is the process breakpoint - it happens when loader finished its initial
                         // work and thunks are resolved
@@ -171,9 +175,17 @@ try
         logger.Write($"Error occured when detaching from the process: {Marshal.GetLastWin32Error()}");
     }
 }
+catch (ArgumentException ex)
+{
+    Console.WriteLine($"ERROR: {ex.Message}");
+}
+catch (Win32Exception ex)
+{
+    Console.WriteLine($"WIN32 ERROR: {ex.Message}, code: 0x{ex.NativeErrorCode:x}");
+}
 catch (Exception ex)
 {
-    Console.WriteLine($"ERROR: {ex}");
+    Console.WriteLine($"CRITICAL ERROR: {ex}");
 }
 
 static (ModuleImport[] OriginalImports, ModuleImport[] NewImports) UpdateProcessImports(HANDLE processHandle,
@@ -232,16 +244,19 @@ static void UpdateForwardedImports(HANDLE processHandle, bool is64bit, nuint ima
             var i => (importName[..i], importName[(i + 1)..])
         };
 
-        var mi = moduleImports.First(mi => mi.DllName == dllName);
-
-        var thunkIndex = Array.FindIndex(mi.FirstThunks, thunk => thunk.Import switch
+        foreach (var mi in moduleImports.Where(mi => mi.DllName == dllName))
         {
-            FunctionImportByName { FunctionName: var name } => name == functionOrOrdinal,
-            FunctionImportByOrdinal { Ordinal: var ordinal } => ordinal.ToString() == functionOrOrdinal,
-            _ => false
-        });
-
-        return mi.FirstThunkRva + (uint)(thunkIndex * thunkSize);
+            if (Array.FindIndex(mi.FirstThunks, thunk => thunk.Import switch
+            {
+                FunctionImportByName { FunctionName: var name } => name == functionOrOrdinal,
+                FunctionImportByOrdinal { Ordinal: var ordinal } => ordinal.ToString() == functionOrOrdinal,
+                _ => false
+            }) is var thunkIndex && thunkIndex != -1)
+            {
+                return mi.FirstThunkRva + (uint)(thunkIndex * thunkSize);
+            }
+        }
+        return 0;
     }
 
     void CopyThunkValues(uint fromRva, uint toRva)
@@ -254,7 +269,7 @@ static void UpdateForwardedImports(HANDLE processHandle, bool is64bit, nuint ima
                 throw new Win32Exception(Marshal.GetLastPInvokeError(), $"{nameof(PInvoke.ReadProcessMemory)} error when reading thunk");
             }
 
-            void *toAddr = (void*)(imageBase + toRva);
+            void* toAddr = (void*)(imageBase + toRva);
             PAGE_PROTECTION_FLAGS oldProtection;
             if (!PInvoke.VirtualProtectEx(processHandle, toAddr, (nuint)thunkSize, PAGE_PROTECTION_FLAGS.PAGE_READWRITE, &oldProtection))
             {
@@ -273,9 +288,16 @@ static void UpdateForwardedImports(HANDLE processHandle, bool is64bit, nuint ima
         var originalThunkRva = GetThunkRva(originalImports, forwardFrom);
         var newThunkRva = GetThunkRva(newImports, forwardTo);
 
-        // new thunk should be resolved by now, so we may copy its value to the original place
-        // that could be referenced by application code
-        CopyThunkValues(newThunkRva, originalThunkRva);
+        if (originalThunkRva != 0 && newThunkRva != 0)
+        {
+            // new thunk should be resolved by now, so we may copy its value to the original place
+            // that could be referenced by application code
+            CopyThunkValues(newThunkRva, originalThunkRva);
+        }
+        else
+        {
+            Console.WriteLine($"WARNING: could not find import {forwardFrom} or {forwardTo}");
+        }
     }
 }
 
