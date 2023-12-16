@@ -26,7 +26,9 @@ Examples:
 
 ## Installation
 
-No installation is required, [download the binaries](FIXME:release) and run it. The executable is 64-bit, but works with both 64- and 32-bit executables.
+No installation is required, [download the binaries](https://github.com/lowleveldesign/importando/releases) and run it.
+
+**The executable is 64-bit, but works with both 64- and 32-bit executables.**
 
 ## When to use
 
@@ -38,7 +40,7 @@ The fix would be to add a forward: `importando.exe -i shell32.dll!StrCpyNW:shlwa
 
 ## How it works
 
-FIXME: link to the blog and youtube video
+If you are interested how importando works, have a look at [this blog post](https://lowleveldesign.wordpress.com/2023/12/18/updating-pe-file-imports-on-process-start/) on my blog.
 
 ## How to make the fix persistent
 
