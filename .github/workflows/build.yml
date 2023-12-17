@@ -23,11 +23,11 @@ jobs:
       run: dotnet test -r win-x64 -c Release
 
     - name: Build and publish importando
-      run: dotnet publish -r win-x64 -c Release -o "%GITHUB_WORKSPACE%\bin.x64"
+      run: dotnet publish -r win-x64 -c Release
 
     - uses: actions/upload-artifact@main
       with:
         name: importando
         path: |
-          bin.x64/importando.exe
-          bin.x64/importando.pdb
+          importando\bin\x64\Release\net8.0-windows\win-x64\publish\importando.exe
+          importando\bin\x64\Release\net8.0-windows\win-x64\publish\importando.pdb
