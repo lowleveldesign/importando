@@ -19,6 +19,9 @@ jobs:
       with:
         dotnet-version: 8.0.x
 
+    - name: Build and test importando
+      run: dotnet test -r win-x64 -c Release
+
     - name: Build and publish importando
       run: dotnet publish -r win-x64 -c Release -o "%GITHUB_WORKSPACE%\bin.x64"
 
