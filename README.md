@@ -1,5 +1,7 @@
 # importando
 
+![build](https://github.com/lowleveldesign/importando/workflows/build/badge.svg)
+
 Importando (**import and o**verride :smirk:) is a console application that allows you to modify PE image imports on process start.
 
 Command line options:
@@ -44,7 +46,7 @@ If you are interested how importando works, have a look at [this blog post](http
 
 ## How to make the fix persistent
 
-You may install importando as a **Image File Execution Options debugger** for a given executable, which would modify the process imports table on every application launch. For example:
+You may install importando as an **Image File Execution Options debugger** for a given executable, which would modify the process imports table on every application launch. For example:
 
 ```
 Windows Registry Editor Version 5.00

@@ -1,0 +1,30 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: cmd
+    
+    steps:
+    - uses: actions/checkout@main
+
+    - uses: actions/setup-dotnet@main
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Build and publish importando
+      run: dotnet publish -r win-x64 -c Release -o "%GITHUB_WORKSPACE%\bin.x64"
+
+    - uses: actions/upload-artifact@main
+      with:
+        name: importando
+        path: |
+          bin.x64/importando.exe
+          bin.x64/importando.pdb

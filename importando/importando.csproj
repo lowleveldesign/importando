@@ -3,10 +3,12 @@
     <PropertyGroup>
         <OutputType>Exe</OutputType>
         <TargetFramework>net8.0-windows</TargetFramework>
+        <Copyright>2023 Sebastian Solnica</Copyright>
+        <AssemblyVersion>1.0.0.0</AssemblyVersion>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-        <PublishTrimmed>true</PublishTrimmed>
+        <PublishAoT>true</PublishAoT>
         <Platforms>x64;x86</Platforms>
     </PropertyGroup>
 
